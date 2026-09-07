@@ -52,6 +52,44 @@ class _RetryableServerError(Exception):
         super().__init__(f"Server error {status}")
 
 
+# MAX API иногда возвращает HTTP 200 с success=False и текстовым
+# описанием ошибки в message, без machine-readable code (например,
+# при попытке отправить/отредактировать сообщение со вложением,
+# которое сервер ещё не успел обработать).
+_ERROR_CODE_BY_MESSAGE_SUBSTRING: dict[str, str] = {
+    "attachment.file.not.processed": "attachment.file.not.processed",
+}
+
+RETRYABLE_ATTACHMENT_ERROR_CODES = frozenset(
+    {"attachment.not.ready", "attachment.file.not.processed"}
+)
+
+
+def _normalize_error_code(raw: dict[str, Any]) -> str | None:
+    """
+    Сопоставляет ``raw["message"]`` с известным ``code``, если сам
+    ``code`` в ответе отсутствует.
+
+    Args:
+        raw: Сырое тело ответа API.
+
+    Returns:
+        str: Нормализованный код ошибки, если ``message`` совпал
+            с одним из известных паттернов.
+        None: Если ``code`` уже присутствует или совпадений
+            не найдено — в этом случае success=False не считается
+            ошибкой библиотеки.
+    """
+    if raw.get("code"):
+        return None
+
+    message = raw.get("message") or ""
+    for substring, code in _ERROR_CODE_BY_MESSAGE_SUBSTRING.items():
+        if substring in message:
+            return code
+    return None
+
+
 class NamedBytesIO(BytesIO):
     """
     BytesIO с поддержкой атрибута .name для единообразия с файловыми объектами.
@@ -217,14 +255,10 @@ class BaseConnection(BotMixin):
 
         raw = await response.json()
 
-        # Костыль: API может вернуть HTTP 200, но с success=False и ошибкой 
-        # "attachment.file.not.processed" или "attachment.not.ready".
-        # Добавляем code для retry-механизма в EditMessage.fetch().
-        # TODO: Убрать, когда MAX API начнет возвращать корректный HTTP статус.
-        if raw.get('success') is False:
-            error_message = raw.get('message', '')
-            
-            if "attachment.file.not.processed" in error_message:
+        if raw.get("success") is False:
+            normalized_code = _normalize_error_code(raw)
+            if normalized_code is not None:
+                raw["code"] = normalized_code
                 if bot.dispatcher:
                     await bot.dispatcher.handle_raw_response(
                         UpdateType.RAW_API_RESPONSE, raw
