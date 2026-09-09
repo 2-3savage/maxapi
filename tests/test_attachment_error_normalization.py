@@ -9,6 +9,7 @@ code (например, для attachment.file.not.processed). Нормализ�
 success=False вместе с деталями вроде failed_user_details.
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,12 +26,20 @@ from maxapi.methods.send_message import SendMessage
 from maxapi.methods.types.added_members_chat import AddedMembersChat
 
 
-def _make_response(status, *, ok=None, json_data=None):
-    """Создаёт мок aiohttp-ответа с async-методами."""
+def _make_response(status, *, ok=None, json_data=None, text=None):
+    """Создаёт мок aiohttp-ответа с async-методами.
+
+    request() читает тело через .text() и парсит его вручную
+    (см. _parse_json_object в connection/base.py), поэтому мок
+    должен отдавать текстовое тело, а не только .json().
+    """
     resp = MagicMock()
     resp.status = status
     resp.ok = ok if ok is not None else (200 <= status < 300)
     resp.read = AsyncMock()
+    if text is None:
+        text = "" if json_data is None else json.dumps(json_data)
+    resp.text = AsyncMock(return_value=text)
     if json_data is not None:
         resp.json = AsyncMock(return_value=json_data)
     return resp

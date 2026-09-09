@@ -500,6 +500,7 @@ class TestBaseConnectionUploadFallback:
         bot.session = None  # force the else-branch
 
         mock_response = AsyncMock()
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value='{"token":"abc"}')
 
         mock_cm = AsyncMock()
@@ -541,6 +542,7 @@ class TestBaseConnectionUploadFallback:
         some_buffer = b"\x00" * 32
 
         mock_response = MagicMock()
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value='{"token":"xyz"}')
 
         mock_context = AsyncMock()
@@ -589,6 +591,7 @@ class TestBaseConnectionUploadFallback:
         some_buffer = b"\x00" * 32
 
         mock_response = AsyncMock()
+        mock_response.status = 200
         mock_response.text = AsyncMock(return_value='{"token":"buf"}')
 
         mock_cm = AsyncMock()
@@ -616,3 +619,50 @@ class TestBaseConnectionUploadFallback:
         assert result == '{"token":"buf"}'
         mock_session_instance.post.assert_called_once()
         mock_cm.__aenter__.assert_called_once()
+
+    async def test_upload_file_buffer_puremagic_pureerror_fallback(self, bot):
+        """upload_file_buffer перехватывает PureError из puremagic
+        и использует fallback-имя/MIME для файлов без magic bytes
+        (например, .txt)."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from maxapi.connection.base import BaseConnection
+        from maxapi.enums.upload_type import UploadType
+        from puremagic.main import PureError
+
+        conn = BaseConnection()
+        conn.bot = bot
+
+        some_buffer = b"plain text content without magic bytes"
+
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value='{"token":"txt"}')
+
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = mock_response
+        mock_context.__aexit__.return_value = None
+
+        bot.session = MagicMock()
+        bot.session.closed = False
+        bot.session.post = MagicMock(return_value=mock_context)
+
+        with patch(
+            "maxapi.connection.base.puremagic.magic_string",
+            side_effect=PureError("Could not identify file"),
+        ):
+            result = await conn.upload_file_buffer(
+                filename="document",
+                url="https://upload.example.com",
+                buffer=some_buffer,
+                type=UploadType.FILE,
+            )
+
+        assert result == '{"token":"txt"}'
+        bot.session.post.assert_called_once()
+        form = bot.session.post.call_args.kwargs["data"]
+        # FormData хранит поля в ._fields как кортежи:
+        # (MultiDict с name/filename, заголовки dict, значение bytes).
+        field = next(f for f in form._fields if f[0].get("name") == "data")
+        assert field[0].get("filename") == "document"  # без расширения
+        assert field[1]["Content-Type"] == "file/*"  # fallback MIME

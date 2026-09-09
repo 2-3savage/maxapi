@@ -7,13 +7,14 @@ __all__ = [
     "BaseMaxWebhook",
 ]
 
-import asyncio
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from ..loggers import logger_dp
-from ..methods.types.getted_updates import process_update_webhook
-from ..types.updates import UNKNOWN_UPDATE_DISCLAIMER
+from ..methods.types.getted_updates import (
+    process_update_webhook,
+    warn_unprocessable_event,
+)
 
 if TYPE_CHECKING:
     from ..bot import Bot
@@ -60,26 +61,38 @@ class BaseMaxWebhook(ABC):
         """Инициализировать диспетчер."""
         await self.dp.startup(self.bot)
 
+    async def _shutdown(self) -> None:
+        """Завершить работу диспетчера при остановке приложения.
+
+        Дожидается фоновых задач ``handle()``
+        (``use_create_task=True``) и освобождает ресурсы изоляции
+        событий. Подключается к lifecycle-хукам конкретного
+        веб-фреймворка в подклассах.
+        """
+        await self.dp.shutdown()
+
     async def _dispatch(self, event_json: dict[str, Any]) -> bool:
         """Распарсить и диспетчеризовать входящее обновление.
 
         Преобразует сырой JSON-payload в типизированный объект
-        события и передаёт диспетчеру. При нераспознанном типе
-        обновления логирует предупреждение и возвращает ``False``.
+        события и передаёт диспетчеру. Если событие не удалось
+        разобрать (неизвестный тип или некорректное содержимое),
+        логирует предупреждение.
+
+        Returns:
+            ``True``, если событие передано диспетчеру,
+            ``False`` — если событие не удалось разобрать.
         """
         event_object = await process_update_webhook(
             event_json=event_json, bot=self.bot
         )
 
         if event_object is None:
-            msg = UNKNOWN_UPDATE_DISCLAIMER.format(
-                update_type=event_json.get("update_type")
-            )
-            logger_dp.warning(msg)
+            warn_unprocessable_event(event_json)
             return False
 
         if self.dp.use_create_task:
-            asyncio.create_task(self.dp.handle(event_object))
+            self.dp.spawn_handle_task(event_object)
         else:
             await self.dp.handle(event_object)
 

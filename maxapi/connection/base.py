@@ -6,6 +6,7 @@ import mimetypes
 import re
 from datetime import datetime
 from io import BytesIO
+from json import loads
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
@@ -20,15 +21,22 @@ from aiohttp import (
     ClientSession,
     FormData,
 )
+from puremagic.main import PureError
 
 from ..client.ssl import connector_kwargs
 from ..enums.api_path import ApiPath
 from ..enums.update import UpdateType
 from ..exceptions.download_file import DownloadFileError
-from ..exceptions.max import InvalidToken, MaxApiError, MaxConnection
+from ..exceptions.max import (
+    InvalidToken,
+    MaxApiError,
+    MaxConnection,
+    MaxUploadFileFailed,
+)
 from ..loggers import logger_bot
 from ..types.bot_mixin import BotMixin
 from ..utils.runtime import bind_bot
+from ..utils.upload_limits import check_upload_size
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -43,23 +51,100 @@ if TYPE_CHECKING:
 
 DOWNLOAD_CHUNK_SIZE = 65536
 
+#: Максимальная длина тела ответа в тексте исключения. Полное тело
+#: уходит подписчикам ``RAW_API_RESPONSE`` без усечения.
+ERROR_DETAILS_LIMIT = 512
+
 
 class _RetryableServerError(Exception):
-    """Внутреннее исключение для retry при серверных ошибках."""
+    """Внутреннее исключение для retry при серверных ошибках.
 
-    def __init__(self, status: int) -> None:
+    Attributes:
+        status: HTTP-статус ответа сервера.
+        body: Прочитанное тело ответа. Пустая строка, если тело
+            не читалось или прочитать его не удалось.
+    """
+
+    def __init__(self, status: int, body: str = "") -> None:
         self.status = status
+        self.body = body
         super().__init__(f"Server error {status}")
+
+
+async def _read_response_text(response: ClientResponse) -> str:
+    """Безопасно читает тело ответа и возвращает его как текст.
+
+    Args:
+        response: Ответ aiohttp.
+
+    Returns:
+        str: Тело ответа. Пустая строка, если тело прочитать
+            не удалось.
+    """
+    try:
+        text = await response.text()
+    except Exception as e:
+        logger_bot.warning("Не удалось прочитать тело ответа: %s", e)
+        response.release()
+        return ""
+
+    return text if isinstance(text, str) else ""
+
+
+def _decode_response_body(text: str) -> str | dict[str, Any]:
+    """Разбирает тело ответа в dict, если это JSON-объект.
+
+    Args:
+        text: Текст тела ответа.
+
+    Returns:
+        str | dict: Разобранный JSON-объект либо исходный текст,
+            если тело пустое или не является JSON-объектом.
+    """
+    parsed = _parse_json_object(text)
+
+    return text if parsed is None else parsed
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    """Парсит тело ответа как JSON-объект.
+
+    Args:
+        text: Текст тела ответа.
+
+    Returns:
+        dict | None: Разобранный JSON-объект либо None, если тело
+            пустое, не является валидным JSON или не является объектом.
+    """
+    if not text.strip():
+        return None
+
+    try:
+        parsed = loads(text)
+    except ValueError:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
 
 
 # MAX API иногда возвращает HTTP 200 с success=False и текстовым
 # описанием ошибки в message, без machine-readable code (например,
 # при попытке отправить/отредактировать сообщение со вложением,
 # которое сервер ещё не успел обработать).
+#
+# success=False сам по себе не является ошибкой библиотеки — часть
+# методов (например AddedMembersChat) легитимно возвращает
+# success=False вместе с деталями вроде failed_user_details, и это
+# не должно приводить к исключению. Поэтому здесь мы нормализуем
+# в raw["code"] только заранее известные подстроки message, и
+# исключение бросается исключительно для них — в этом единственном
+# месте, а не отдельными проверками текста ошибки в каждом методе.
 _ERROR_CODE_BY_MESSAGE_SUBSTRING: dict[str, str] = {
     "attachment.file.not.processed": "attachment.file.not.processed",
 }
 
+#: Коды ошибок, при которых SendMessage/EditMessage повторяют
+#: запрос, ожидая обработки вложения сервером.
 RETRYABLE_ATTACHMENT_ERROR_CODES = frozenset(
     {"attachment.not.ready", "attachment.file.not.processed"}
 )
@@ -131,6 +216,125 @@ def _on_backoff(details: Details) -> None:
         )
 
 
+async def _session_request(
+    session: ClientSession, *args: Any, **kwargs: Any
+) -> ClientResponse:
+    """Выполнить запрос, переведя «Session is closed» в retryable-ошибку.
+
+    ``aiohttp`` бросает голый ``RuntimeError``, если сессию закрыли
+    между её получением и стартом запроса. Ни одного байта при этом
+    не отправлено, поэтому попытку безопасно повторить: на следующей
+    итерации ``ensure_session()`` выдаст живую сессию.
+
+    Args:
+        session: Сессия, через которую выполняется запрос.
+        *args: Позиционные аргументы ``ClientSession.request``.
+        **kwargs: Именованные аргументы ``ClientSession.request``.
+
+    Returns:
+        Ответ сервера.
+
+    Raises:
+        ClientConnectionError: Если сессия была закрыта до старта.
+    """
+
+    try:
+        return await session.request(*args, **kwargs)
+    except RuntimeError as e:
+        if session.closed:
+            raise ClientConnectionError(
+                "Сессия была закрыта до отправки запроса"
+            ) from e
+        raise
+
+
+async def _read_error_payload(resp: ClientResponse) -> dict[str, Any]:
+    """Прочитать тело ошибочного ответа, не падая на не-JSON.
+
+    Args:
+        resp: Ответ, тело которого нужно прочитать.
+
+    Returns:
+        Разобранный JSON-объект, ``{"error": <тело>}`` для остальных
+        форматов или пустой словарь, если тело прочитать не удалось.
+    """
+
+    try:
+        payload = await resp.json(content_type=None)
+    except Exception:
+        try:
+            text = await resp.text()
+        except Exception:
+            return {}
+        return {"error": text} if text else {}
+
+    if isinstance(payload, dict):
+        return payload
+    return {"error": payload} if payload is not None else {}
+
+
+def _error_details(raw: dict[str, Any]) -> str:
+    """Отрендерить тело ошибки для текста исключения.
+
+    Не-JSON тело ``_read_error_payload`` кладёт одной строкой под ключ
+    ``error``. Её режем напрямую: ``str(raw)`` на многомегабайтной
+    странице от прокси заново материализовал бы её целиком (да ещё и
+    с экранированием) только ради того, чтобы отбросить всё после
+    ``ERROR_DETAILS_LIMIT``.
+
+    Args:
+        raw: Тело ответа.
+
+    Returns:
+        Диагностика, обрезанная до ``ERROR_DETAILS_LIMIT`` символов.
+    """
+
+    text = raw.get("error")
+    if len(raw) == 1 and isinstance(text, str):
+        details = text
+    else:
+        details = str(raw)
+
+    if len(details) > ERROR_DETAILS_LIMIT:
+        return f"{details[:ERROR_DETAILS_LIMIT]}…"
+    return details
+
+
+def _invalid_token_message(raw: dict[str, Any]) -> str:
+    """Собрать текст ``InvalidToken`` с усечённой диагностикой.
+
+    Args:
+        raw: Тело ответа 401.
+
+    Returns:
+        Сообщение об ошибке; тело обрезается до
+        ``ERROR_DETAILS_LIMIT`` символов, чтобы многомегабайтная
+        страница от прокси не утекла в логи целиком.
+    """
+
+    message = "Неверный токен!"
+    if not raw:
+        return message
+
+    return f"{message} Ответ API: {_error_details(raw)}"
+
+
+def _schedule_raw_response(bot: Bot, raw: Any) -> None:
+    """Уведомить подписчиков ``RAW_API_RESPONSE``, не блокируя запрос.
+
+    Args:
+        bot: Бот, чей диспетчер получит событие.
+        raw: Сырой ответ API.
+    """
+
+    if bot.dispatcher:
+        asyncio.create_task(
+            bot.dispatcher.handle_raw_response(
+                UpdateType.RAW_API_RESPONSE, raw
+            )
+        )
+
+
 class BaseConnection(BotMixin):
     """
     Базовый класс для всех методов API.
@@ -167,7 +371,7 @@ class BaseConnection(BotMixin):
             url: Новый API URL
         """
 
-        self.api_url = url
+        self.api_url = url.rstrip("/")
 
     async def request(
         self,
@@ -202,14 +406,16 @@ class BaseConnection(BotMixin):
             RuntimeError: Если бот не инициализирован.
             MaxConnection: Ошибка соединения.
             InvalidToken: Ошибка авторизации (401).
-            MaxApiError: Ошибка API (после исчерпания retry).
+            MaxApiError: Ошибка API (после исчерпания retry), а также
+                если успешный ответ не содержит JSON-объекта.
         """
 
         bot = self._ensure_bot()
         conn = bot.default_connection
         retry_statuses = conn.retry_on_statuses
 
-        url = path.value if isinstance(path, ApiPath) else path
+        path_str = path.value if isinstance(path, ApiPath) else path
+        url = bot.api_url + path_str
 
         @backoff.on_exception(
             backoff.expo,
@@ -220,19 +426,28 @@ class BaseConnection(BotMixin):
         )
         async def _do_request() -> Any:
             session = await bot.ensure_session()
-            resp = await session.request(
+            resp = await _session_request(
+                session,
                 method=method.value,
                 url=url,
                 **kwargs,
             )
 
             if resp.status == 401:
-                await session.close()
-                raise InvalidToken("Неверный токен!")
+                # finally, а не последовательность: отмена во время
+                # чтения тела бросает CancelledError мимо except
+                # Exception, и ответ остался бы неосвобождённым
+                try:
+                    raw = await _read_error_payload(resp)
+                finally:
+                    resp.release()
+                _schedule_raw_response(bot, raw)
+                raise InvalidToken(_invalid_token_message(raw))
 
             if resp.status in retry_statuses:
-                await resp.read()
-                raise _RetryableServerError(resp.status)
+                raise _RetryableServerError(
+                    resp.status, await _read_response_text(resp)
+                )
 
             return resp
 
@@ -241,47 +456,81 @@ class BaseConnection(BotMixin):
         except ClientConnectionError as e:
             raise MaxConnection(f"Ошибка при отправке запроса: {e}") from e
         except _RetryableServerError as e:
-            raise MaxApiError(code=e.status, raw={"error": str(e)}) from e
+            raw = _decode_response_body(e.body)
+            _schedule_raw_response(bot, raw)
+            raise MaxApiError(code=e.status, raw=raw) from e
+
+        text = await _read_response_text(response)
 
         if not response.ok:
-            raw = await response.json()
-            if bot.dispatcher:
-                asyncio.create_task(
-                    bot.dispatcher.handle_raw_response(
-                        UpdateType.RAW_API_RESPONSE, raw
-                    )
-                )
+            raw = _decode_response_body(text)
+            _schedule_raw_response(bot, raw)
             raise MaxApiError(code=response.status, raw=raw)
 
-        raw = await response.json()
+        parsed = _parse_json_object(text)
 
-        if raw.get("success") is False:
-            normalized_code = _normalize_error_code(raw)
+        if parsed is None:
+            # API всегда отвечает JSON-объектом: пустое или не-JSON
+            # тело при 2xx — такой же сбой, как и не-2xx ответ
+            _schedule_raw_response(bot, text)
+            raise MaxApiError(code=response.status, raw=text)
+
+        if parsed.get("success") is False:
+            normalized_code = _normalize_error_code(parsed)
             if normalized_code is not None:
-                raw["code"] = normalized_code
-                if bot.dispatcher:
-                    await bot.dispatcher.handle_raw_response(
-                        UpdateType.RAW_API_RESPONSE, raw
-                    )
-                raise MaxApiError(code=400, raw=raw)
+                parsed["code"] = normalized_code
+                _schedule_raw_response(bot, parsed)
+                raise MaxApiError(code=400, raw=parsed)
 
-        if bot.dispatcher:
-            asyncio.create_task(
-                bot.dispatcher.handle_raw_response(
-                    UpdateType.RAW_API_RESPONSE, raw
-                )
-            )
+        _schedule_raw_response(bot, parsed)
 
         if is_return_raw:
-            return raw
+            return parsed
 
-        model = model(**raw)  # type: ignore
+        model = model(**parsed)  # type: ignore
 
         return bind_bot(model, bot)
+
+    @staticmethod
+    async def _read_upload_response(response: ClientResponse) -> str:
+        """
+        Проверяет статус ответа upload-сервера и возвращает его тело.
+
+        Args:
+            response: Ответ upload-сервера.
+
+        Returns:
+            str: Сырой .text() ответ от сервера.
+
+        Raises:
+            MaxUploadFileFailed: Если статус ответа не успешный
+                или тело ответа не удалось прочитать.
+        """
+
+        try:
+            text = await response.text()
+        except Exception as e:
+            # Ответ освобождается вызывающим async with session.post
+            raise MaxUploadFileFailed(
+                f"Не удалось прочитать ответ upload-сервера: {e}"
+            ) from e
+
+        # response.ok в aiohttp означает status < 400 и пропускает
+        # 3xx — upload-сервер же обязан отвечать строго 2xx
+        if not 200 <= response.status < 300:
+            raise MaxUploadFileFailed(
+                f"Ошибка при загрузке файла: HTTP {response.status}, "
+                f"ответ: {text}"
+            )
+
+        return text
 
     async def upload_file(self, url: str, path: str, type: UploadType) -> str:
         """
         Загружает файл на сервер.
+
+        При превышении лимита загрузки MAX пишется предупреждение
+        в логгер `bot`, загрузка не прерывается.
 
         Args:
             url: URL загрузки.
@@ -290,6 +539,9 @@ class BaseConnection(BotMixin):
 
         Returns:
             str: Сырой .text() ответ от сервера.
+
+        Raises:
+            MaxUploadFileFailed: Если upload-сервер вернул не-2xx ответ.
         """
 
         async with aiofiles.open(path, "rb") as f:
@@ -297,6 +549,8 @@ class BaseConnection(BotMixin):
 
         path_object = Path(path)
         basename = path_object.name
+
+        check_upload_size(len(file_data), type, name=basename)
 
         form = FormData(quote_fields=False)
         form.add_field(
@@ -311,7 +565,7 @@ class BaseConnection(BotMixin):
         session = bot.session
         if session is not None and not session.closed:
             async with session.post(url=url, data=form) as response:
-                return await response.text()
+                return await self._read_upload_response(response)
         else:
             async with (
                 ClientSession(
@@ -320,13 +574,16 @@ class BaseConnection(BotMixin):
                 ) as temp_session,
                 temp_session.post(url=url, data=form) as response,
             ):
-                return await response.text()
+                return await self._read_upload_response(response)
 
     async def upload_file_buffer(
         self, filename: str, url: str, buffer: bytes, type: UploadType
     ) -> str:
         """
         Загружает файл из буфера.
+
+        При превышении лимита загрузки MAX пишется предупреждение
+        в логгер `bot`, загрузка не прерывается.
 
         Args:
             filename: Имя файла.
@@ -336,7 +593,12 @@ class BaseConnection(BotMixin):
 
         Returns:
             str: Сырой .text() ответ от сервера.
+
+        Raises:
+            MaxUploadFileFailed: Если upload-сервер вернул не-2xx ответ.
         """
+
+        check_upload_size(len(buffer), type, name=filename)
 
         try:
             matches = puremagic.magic_string(buffer[:4096])
@@ -346,7 +608,7 @@ class BaseConnection(BotMixin):
             else:
                 mime_type = f"{type.value}/*"
                 ext = ""
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, PureError):
             mime_type = f"{type.value}/*"
             ext = ""
 
@@ -365,7 +627,7 @@ class BaseConnection(BotMixin):
         session = bot.session
         if session is not None and not session.closed:
             async with session.post(url=url, data=form) as response:
-                return await response.text()
+                return await self._read_upload_response(response)
         else:
             async with (
                 ClientSession(
@@ -374,11 +636,10 @@ class BaseConnection(BotMixin):
                 ) as temp_session,
                 temp_session.post(url=url, data=form) as response,
             ):
-                return await response.text()
+                return await self._read_upload_response(response)
 
     async def _fetch_response(self, url: str) -> ClientResponse:
         bot = self._ensure_bot()
-        session = await bot.ensure_session()
         conn = bot.default_connection
 
         @backoff.on_exception(
@@ -389,7 +650,8 @@ class BaseConnection(BotMixin):
             on_backoff=_on_backoff,
         )
         async def _do_request() -> Any:
-            resp = await session.request("GET", url)
+            session = await bot.ensure_session()
+            resp = await _session_request(session, "GET", url)
             if resp.status in conn.retry_on_statuses:
                 await resp.read()
                 raise _RetryableServerError(resp.status)
